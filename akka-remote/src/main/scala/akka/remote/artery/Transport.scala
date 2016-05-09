@@ -41,44 +41,55 @@ import akka.remote.RemoteRef
 import akka.actor.ActorSelection
 import akka.actor.ActorRef
 import akka.stream.scaladsl.Keep
+import akka.remote.UniqueAddress
+import akka.remote.artery.ReplyJunction.ReplySubject
+
+/**
+ * INTERNAL API
+ * Inbound API that is used by the stream stages.
+ * Separate trait to facilitate testing without real transport.
+ */
+private[akka] trait InboundContext {
+  def localAddress: UniqueAddress
+  def sendReply(to: Address, message: AnyRef): Unit
+  def association(remoteAddress: Address): OutboundContext
+}
 
 /**
  * INTERNAL API
  */
-private[akka] object Transport {
-  // FIXME avoid allocating this envelope?
-  final case class InboundEnvelope(
-    recipient: InternalActorRef,
-    recipientAddress: Address,
-    message: AnyRef,
-    senderOption: Option[ActorRef])
-}
+private[akka] final case class InboundEnvelope(
+  recipient: InternalActorRef,
+  recipientAddress: Address,
+  message: AnyRef,
+  senderOption: Option[ActorRef])
 
 /**
  * INTERNAL API
  */
 // FIXME: Replace the codec with a custom made, hi-perf one
 private[akka] class Transport(
-  val localAddress: Address,
+  override val localAddress: UniqueAddress,
+  val arterySubsystem: ArterySubsystem,
   val system: ExtendedActorSystem,
   val materializer: Materializer,
   val provider: RemoteActorRefProvider,
-  val codec: AkkaPduCodec) {
-  import Transport._
+  val codec: AkkaPduCodec) extends InboundContext {
 
   private val log: LoggingAdapter = Logging(system.eventStream, getClass.getName)
   private val remoteDaemon = provider.remoteDaemon
 
   private implicit val mat = materializer
   // TODO support port 0
-  private val inboundChannel = s"aeron:udp?endpoint=${localAddress.host.get}:${localAddress.port.get}"
+  private val inboundChannel = s"aeron:udp?endpoint=${localAddress.address.host.get}:${localAddress.address.port.get}"
   private def outboundChannel(a: Address) = s"aeron:udp?endpoint=${a.host.get}:${a.port.get}"
   private val systemMessageStreamId = 1
   private val ordinaryStreamId = 3
 
   private val systemMessageResendInterval: FiniteDuration = 1.second // FIXME config
 
-  private var systemMessageReplyJunction: SystemMessageReplyJunction.Junction = _
+  private var _replySubject: ReplySubject = _
+  def replySubject: ReplySubject = _replySubject
 
   // Need an ActorRef that is passed in the `SystemMessageEnvelope.ackReplyTo`.
   // Those messages are not actually handled by this actor, but intercepted by the
@@ -132,7 +143,7 @@ private[akka] class Transport(
 
   def start(): Unit = {
     taskRunner.start()
-    systemMessageReplyJunction = Source.fromGraph(new AeronSource(inboundChannel, systemMessageStreamId, aeron, taskRunner))
+    _replySubject = Source.fromGraph(new AeronSource(inboundChannel, systemMessageStreamId, aeron, taskRunner))
       .async // FIXME use dedicated dispatcher for AeronSource
       .map(ByteString.apply) // TODO we should use ByteString all the way
       .viaMat(inboundSystemMessageFlow)(Keep.right)
@@ -153,22 +164,29 @@ private[akka] class Transport(
     Future.successful(Done)
   }
 
+  override def sendReply(to: Address, message: AnyRef) =
+    arterySubsystem.sendReply(to, message)
+
+  override def association(remoteAddress: Address): OutboundContext =
+    arterySubsystem.associate(remoteAddress)
+
   val killSwitch: SharedKillSwitch = KillSwitches.shared("transportKillSwitch")
 
-  def outbound(remoteAddress: Address): Sink[Send, Any] = {
+  def outbound(outboundContext: OutboundContext): Sink[Send, Any] = {
     Flow.fromGraph(killSwitch.flow[Send])
+      .via(new OutboundHandshake(outboundContext))
       .via(encoder)
       .map(_.toArray) // TODO we should use ByteString all the way
-      .to(new AeronSink(outboundChannel(remoteAddress), ordinaryStreamId, aeron, taskRunner))
+      .to(new AeronSink(outboundChannel(outboundContext.remoteAddress), ordinaryStreamId, aeron, taskRunner))
   }
 
-  def outboundSystemMessage(remoteAddress: Address): Sink[Send, Any] = {
+  def outboundSystemMessage(outboundContext: OutboundContext): Sink[Send, Any] = {
     Flow.fromGraph(killSwitch.flow[Send])
-      .via(new SystemMessageDelivery(systemMessageReplyJunction, systemMessageResendInterval,
-        localAddress, remoteAddress, systemMessageReplyRecepient))
+      .via(new OutboundHandshake(outboundContext))
+      .via(new SystemMessageDelivery(outboundContext, systemMessageResendInterval))
       .via(encoder)
       .map(_.toArray) // TODO we should use ByteString all the way
-      .to(new AeronSink(outboundChannel(remoteAddress), systemMessageStreamId, aeron, taskRunner))
+      .to(new AeronSink(outboundChannel(outboundContext.remoteAddress), systemMessageStreamId, aeron, taskRunner))
   }
 
   // TODO: Try out parallelized serialization (mapAsync) for performance
@@ -176,7 +194,7 @@ private[akka] class Transport(
     val pdu: ByteString = codec.constructMessage(
       sendEnvelope.recipient.localAddressToUse,
       sendEnvelope.recipient,
-      Serialization.currentTransportInformation.withValue(Serialization.Information(localAddress, system)) {
+      Serialization.currentTransportInformation.withValue(Serialization.Information(localAddress.address, system)) {
         MessageSerializer.serialize(system, sendEnvelope.message.asInstanceOf[AnyRef])
       },
       sendEnvelope.senderOption,
@@ -192,7 +210,7 @@ private[akka] class Transport(
     Framing.lengthField(4, maximumFrameLength = 256000)
       .map { frame ⇒
         // TODO: Drop unserializable messages
-        val pdu = codec.decodeMessage(frame.drop(4), provider, localAddress)._2.get
+        val pdu = codec.decodeMessage(frame.drop(4), provider, localAddress.address)._2.get
         pdu
       }
 
@@ -211,15 +229,20 @@ private[akka] class Transport(
 
   val inboundFlow: Flow[ByteString, ByteString, NotUsed] = {
     Flow.fromSinkAndSource(
-      decoder.via(deserializer).to(messageDispatcher),
+      decoder
+        .via(deserializer)
+        .via(new InboundHandshake(this))
+        .to(messageDispatcher),
       Source.maybe[ByteString].via(killSwitch.flow))
   }
 
-  val inboundSystemMessageFlow: Flow[ByteString, ByteString, SystemMessageReplyJunction.Junction] = {
+  val inboundSystemMessageFlow: Flow[ByteString, ByteString, ReplySubject] = {
     Flow.fromSinkAndSourceMat(
-      decoder.via(deserializer)
-        .via(new SystemMessageAcker(localAddress))
-        .viaMat(new SystemMessageReplyJunction)(Keep.right)
+      decoder
+        .via(deserializer)
+        .via(new InboundHandshake(this))
+        .via(new SystemMessageAcker(this))
+        .viaMat(new ReplyJunction)(Keep.right)
         .to(messageDispatcher),
       Source.maybe[ByteString].via(killSwitch.flow))((a, b) ⇒ a)
   }
